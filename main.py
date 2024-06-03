@@ -20,11 +20,24 @@ NIGHT_END = datetime.time(4, 55)
 ## ============================================================ ##
 
 ## ==================== Global Variables ==================== ##
+ttbModule = None
 data = None
 record = None
 
+first_round = True
+current_time = None
+next_update_time = None
+tem_data = None
+
 kdj = None
 bband = None
+current_position_type = None
+
+is_squeeze = False
+open_long_ready = False
+open_short_ready = False
+sell_ready = False
+sl_price = None
 
 ## ==================== Functions ==================== ##
 def is_morning(time: datetime.datetime):
@@ -96,29 +109,137 @@ def bbands_keltner(high: np.ndarray, low: np.ndarray, close: np.ndarray, bb_peri
         bb_lower,
     ]
     return ta.RSI(close, timeperiod = period)
+
+def update_data(obj):
+    global first_round, current_time, next_update_time
+    if first_round:
+        current_time = datetime.datetime.strptime(obj['TickTime'], '%H:%M:%S')
+        next_update_time = current_time + datetime.timedelta(minutes = 1)
+        first_round = False
+
+    tem_data = pd.DataFrame(columns = ['datetime', 'open', 'high', 'low', 'close', 'volume'])
 ## ============================================================ ##
 
-
-
-
-
-
-
+## ==================== Start the strategy with TTB Process ==================== ##
 class TTBProcess(TTBModule):
     def SHOWQUOTEDATA(self, obj):
-        print(type(obj))
-        print(obj)
-        # print("Symbol:{}, BidPs:{}, BidPv:{}, AskPs:{}, AskPv:{}, T:{}, P:{}, V:{}, Volume:{}".format(obj['Symbol'],obj['BidPs'],obj['BidPv'],obj['AskPs'],obj['AskPv'],obj['TickTime'],obj['Price'],obj['Qty'],obj['Volume']))  
+        global ttbModule, data, record
+        global kdj, bband, current_position_type
+        global is_squeeze, open_long_ready, open_short_ready, sell_ready, sl_price
 
+        # Check if the current time is in trading time
+        if not is_trading_time(datetime.datetime.now()):
+            return
+
+        # Set the current_position_type to 'None' if there is no position
+        
+        if len(ttbModule.QUERYRESTOREFILLREPORT()['Data']) == 0:
+            current_position_type = 'None'
+
+        # Close the position if current time reaches the end of the time we set up
+        if current_position_type != 'None' and current_time.time() > MORNING_END:
+            if current_position_type == 'long':
+                pass
+            elif current_position_type == 'short':
+                pass
+
+        # Update the data
+        update_data(obj)
+
+        # Check if BBand is squeezing
+        if bband[0]:
+            is_squeeze = True
+            open_long_ready = False
+        else:
+            is_squeeze = False
+
+        latest_close = data.Close.iloc[-1]
+        latest_open = data.Open.iloc[-1]
+        latest_bb_up = bband[1][-1]
+        latest_bb_down = bband[2][-1]
+        latest_j = kdj['j']
+
+        # Check if the precondition to open long/short position is satisfied
+        if current_position_type == 'None' and is_squeeze:
+            if latest_close < latest_bb_down and latest_j < 20:
+                open_long_ready = True
+                print("開多單條件符合")
+            elif latest_close > latest_bb_up and latest_j > 80:
+                open_short_ready = True
+                print("開空單條件符合")
+
+        # Check if it's time to open long/short position
+        if current_position_type == 'None' and open_short_ready:
+            if latest_j < 80 and latest_close < latest_open:
+                trader.sell(size = 1)
+                sl_price = max(data.High.iloc[-i] for i in range(1, 6))
+                sell_ready = False
+                print("開空單")
+                return
+            elif latest_j < 80 and latest_close < latest_open:
+                trader.sell(size = 1)
+                sl_price = max(data.High.iloc[-i] for i in range(1, 6))
+                sell_ready = False
+                print("開空單")
+
+        # Check if the precondition to close long/short position is satisfied
+        if current_position_type == 'long':
+            if latest_j > 80:
+                sell_ready = True
+                print("準備平倉")
+                return
+        elif current_position_type == 'short':
+            if latest_j < 20:
+                sell_ready = True
+                print("準備平倉")
+                return
+            
+        # Check if it's time to close long/short position
+        if current_position_type == 'long':
+            if sell_ready and latest_j <= 80:
+                trader.sell(size = 1)
+                sell_ready = False
+                print("平倉")
+                return
+
+            elif latest_close < sl_price:
+                trader.sell(size = 1)
+                sell_ready = False
+                print("停損平倉")
+                return
+        elif current_position_type == 'short':
+            if sell_ready and latest_j >= 20:
+                trader.buy(size = 1)
+                sell_ready = False
+                print("平倉")
+                return
+
+            elif latest_close > sl_price:
+                trader.buy(size = 1)
+                sell_ready = False
+                print("停損平倉")
+                return
+## ============================================================ ##
+
+## ==================== Main ==================== ##
 if __name__ == "__main__":
     # Read data
     if not os.path.exists(DATA_PATH):
+        print('Data file not found. Creating new data file.')
         with open(DATA_PATH, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['datetime', 'open', 'high', 'low', 'close', 'volume', 'k', 'd', 'j'])
             data = pd.DataFrame(columns = ['datetime', 'open', 'high', 'low', 'close', 'volume', 'k', 'd', 'j'])
     else:
+        print('Data file found. Reading data file.')
         data = pd.read_csv(DATA_PATH)
+        print('Data file read successfully.')
+
+    # get the previous kdj
+    if len(data.j) > 0:
+        print('Reading previous KDJ data.')
+        kdj = {'k': data.k.iloc[-1], 'd': data.d.iloc[-1], 'j': data.j.iloc[-1]}
+        print('KDJ data read successfully.')
 
     # Start connection to TTB
     ttbModule = TTBProcess('http://localhost:8080', 51141)
@@ -126,8 +247,12 @@ if __name__ == "__main__":
 
     # Read trading record
     if not os.path.exists(RECORD_FILE_PATH):
+        print('Record file not found. Creating new record file.')
         with open(RECORD_FILE_PATH, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['Entry Time', 'Entry Price', 'Exit Time', 'Exit Price', 'Profit', 'Volume'])
     else:
+        print('Record file found. Reading record file.')
         record = pd.read_csv(RECORD_FILE_PATH)
+        print('Record file read successfully.')
+## ============================================================ ##
